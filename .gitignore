@@ -1,0 +1,22 @@
+# Python venv
+bin/
+include/
+lib/
+lib64/
+pyvenv.cfg
+share/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model cache (can be large)
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
