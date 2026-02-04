@@ -88,16 +88,91 @@ def create_virtual_sink(sink_name, sink_description):
         return False
 
 
+def get_sink_id(sink_name):
+    """Get the numeric sink ID by name"""
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == sink_name:
+                sink_id = parts[0]
+                print(f"[Setup] Found sink ID {sink_id} for {sink_name}")
+                return sink_id
+
+        print(f"[Setup] Sink {sink_name} not found")
+        return None
+    except Exception as e:
+        print(f"[Setup] Error getting sink ID: {e}")
+        return None
+
+
+def set_default_sink(sink_name):
+    """Set the default sink with retry logic"""
+    max_retries = 5
+    retry_delay = 1
+
+    for attempt in range(max_retries):
+        try:
+            # First verify the sink exists
+            result = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            if sink_name not in result.stdout:
+                print(f"[Setup] Sink {sink_name} not found, retrying... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                continue
+
+            # Set the default sink
+            result = subprocess.run(
+                ["pactl", "set-default-sink", sink_name],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                print(f"[Setup] Set default sink to: {sink_name}")
+                return True
+            else:
+                print(f"[Setup] Error setting default sink: {result.stderr}")
+                return False
+
+        except Exception as e:
+            print(f"[Setup] Error setting default sink (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+
+    print(f"[Setup] Failed to set default sink after {max_retries} attempts")
+    return False
+
+
 def create_all_virtual_sinks():
-    """Create all virtual sinks"""
+    """Create all virtual sinks and set the first one as default"""
     print("[Setup] Creating virtual sinks...")
     success_count = 0
+    first_sink = None
 
     for key, config in VIRTUAL_SINKS.items():
         if create_virtual_sink(config["sink_name"], config["sink_description"]):
             success_count += 1
+            if first_sink is None:
+                first_sink = config["sink_name"]
 
     print(f"[Setup] Created {success_count}/{len(VIRTUAL_SINKS)} virtual sinks")
+
+    # Set the first virtual sink as default
+    if first_sink:
+        set_default_sink(first_sink)
+
     return success_count > 0
 
 
@@ -269,22 +344,24 @@ class AudioCaptureThread(threading.Thread):
 
 
 class AudioPlaybackThread(threading.Thread):
-    """Play audio to physical sink"""
+    """Play audio to physical sink using sink ID to avoid routing issues"""
 
-    def __init__(self, physical_sink, output_queue):
+    def __init__(self, physical_sink_id, output_queue, physical_sink_name):
         super().__init__(daemon=True)
-        self.physical_sink = physical_sink
+        self.physical_sink_id = physical_sink_id
+        self.physical_sink_name = physical_sink_name
         self.output_queue = output_queue
         self.running = True
         self.process = None
 
     def run(self):
-        print(f"[Playback] Starting playback to {self.physical_sink}")
+        print(f"[Playback] Starting playback to sink ID {self.physical_sink_id} ({self.physical_sink_name})")
 
         try:
             # Pre-fill with silence to keep pacat alive
             silence = np.zeros(48000, dtype=np.float32).tobytes()  # 1 second of silence
 
+            # Use -d with numeric ID to avoid routing to default sink
             self.process = subprocess.Popen(
                 [
                     "pacat",
@@ -292,7 +369,7 @@ class AudioPlaybackThread(threading.Thread):
                     f"--rate={OUTPUT_RATE}",
                     "--channels=1",
                     "--latency-msec=200",
-                    "--device", self.physical_sink,
+                    "-d", str(self.physical_sink_id),
                     "--playback"
                 ],
                 stdin=subprocess.PIPE,
@@ -347,6 +424,10 @@ class DeviceProcessor:
         self.sink_name = config["sink_name"]
         self.monitor_source = config["sink_name"] + ".monitor"
         self.physical_sink = config["physical_sink"]
+        # Get the physical sink ID to avoid routing issues
+        self.physical_sink_id = get_sink_id(self.physical_sink)
+        if not self.physical_sink_id:
+            raise ValueError(f"Could not find sink ID for {self.physical_sink}")
         self.description = config["sink_description"]
 
         self.input_queue = mp.Queue(maxsize=10)
@@ -375,7 +456,7 @@ class DeviceProcessor:
             self.monitor_source, self.input_queue
         )
         self.playback_thread = AudioPlaybackThread(
-            self.physical_sink, self.output_queue
+            self.physical_sink_id, self.output_queue, self.physical_sink
         )
 
         self.capture_thread.start()
@@ -477,32 +558,26 @@ class NovaSRDaemon:
             return None
 
     def monitor_and_process(self):
-        """Monitor which sinks are active and start/stop processing accordingly"""
+        """Always keep audio processing running and periodically ensure default sink"""
         print("[Daemon] Starting monitor loop...")
+
+        # Start all processors immediately
+        for name, config in VIRTUAL_SINKS.items():
+            if name not in self.processors:
+                self.processors[name] = DeviceProcessor(config)
+                self.processors[name].start()
+                print(f"[Daemon] Started processing for {config['sink_description']}")
 
         while self.running:
             try:
-                # Get current default sink
+                # Periodically ensure the virtual sink is the default (every 10 seconds)
                 default_sink = self.get_active_sink()
-
                 for name, config in VIRTUAL_SINKS.items():
                     virtual_sink = config["sink_name"]
-
-                    # Check if this virtual sink is the default
-                    if default_sink == virtual_sink:
-                        # Start/restart processing if not active
-                        if name not in self.processors:
-                            self.processors[name] = DeviceProcessor(config)
-                            self.processors[name].start()
-                        elif not self.processors[name].active:
-                            # Use restart to get fresh queues
-                            self.processors[name].restart()
-                    else:
-                        # Stop processing if active (with cooldown)
-                        if name in self.processors and self.processors[name].active:
-                            time.sleep(0.5)
-                            if self.get_active_sink() != virtual_sink:
-                                self.processors[name].stop()
+                    if default_sink != virtual_sink:
+                        print(f"[Daemon] Re-enforcing default sink to {virtual_sink}")
+                        set_default_sink(virtual_sink)
+                        break
 
                 time.sleep(self.check_interval)
 
