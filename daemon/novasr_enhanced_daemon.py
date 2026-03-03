@@ -19,6 +19,7 @@ import threading
 import time
 import signal
 import multiprocessing as mp
+import hashlib
 from queue import Empty
 import numpy as np
 import torch
@@ -35,14 +36,75 @@ RESAMPLE_CHUNK_SIZE = CHUNK_SIZE * 3  # 48kHz chunk for downsampling
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 DEVICE = "cpu"
 
-# Virtual sink configurations
-VIRTUAL_SINKS = {
-    "novasr_speakers": {
-        "sink_name": "novasr_speakers",
-        "sink_description": "NovaSR_Enhanced_Speakers",
-        "physical_sink": "alsa_output.pci-0000_c1_00.6.HiFi__Speaker__sink",
+# Prefix for our virtual sinks (to identify them)
+NOVASR_PREFIX = "novasr_enhanced_"
+
+# Sinks to ignore (virtual sinks, monitors, etc.)
+IGNORE_PATTERNS = ["novasr_", ".monitor", "auto_null"]
+
+
+def get_physical_sinks():
+    """Get list of physical output sinks (excluding our virtual sinks)"""
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        sinks = []
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                sink_name = parts[1]
+                # Skip sinks that match ignore patterns
+                if any(pattern in sink_name for pattern in IGNORE_PATTERNS):
+                    continue
+                sinks.append({
+                    "id": parts[0],
+                    "name": sink_name,
+                })
+
+        return sinks
+    except Exception as e:
+        print(f"[Setup] Error getting physical sinks: {e}")
+        return []
+
+
+def generate_virtual_sink_config(physical_sink):
+    """Generate a virtual sink config for a physical sink"""
+    name = physical_sink["name"]
+
+    # Create a friendly description and short name
+    if "HiFi" in name:
+        if "Headphones" in name:
+            friendly = "Headphones"
+        elif "Speaker" in name:
+            friendly = "Speakers"
+        else:
+            friendly = "HiFi"
+    elif "hdmi" in name.lower():
+        friendly = "HDMI"
+    elif "usb" in name.lower():
+        friendly = "USB_Audio"
+    elif "bluez" in name.lower() or "bluetooth" in name.lower():
+        friendly = "Bluetooth"
+    else:
+        friendly = name.split(".")[-1][:12]
+
+    # Create unique but short sink name using hash of physical name
+    name_hash = hashlib.md5(name.encode()).hexdigest()[:4]
+    sink_name = f"novasr_{friendly.lower()}_{name_hash}"
+
+    return {
+        "sink_name": sink_name,
+        "sink_description": f"NovaSR_{friendly}",
+        "physical_sink": physical_sink["name"],
+        "physical_sink_id": physical_sink["id"],
     }
-}
 
 
 def create_virtual_sink(sink_name, sink_description):
@@ -156,24 +218,19 @@ def set_default_sink(sink_name):
 
 
 def create_all_virtual_sinks():
-    """Create all virtual sinks and set the first one as default"""
-    print("[Setup] Creating virtual sinks...")
-    success_count = 0
-    first_sink = None
+    """Create virtual sinks for all current physical sinks"""
+    print("[Setup] Scanning for physical sinks...")
+    physical_sinks = get_physical_sinks()
+    print(f"[Setup] Found {len(physical_sinks)} physical sink(s)")
 
-    for key, config in VIRTUAL_SINKS.items():
+    configs = {}
+    for sink in physical_sinks:
+        config = generate_virtual_sink_config(sink)
+        configs[config["sink_name"]] = config
         if create_virtual_sink(config["sink_name"], config["sink_description"]):
-            success_count += 1
-            if first_sink is None:
-                first_sink = config["sink_name"]
+            print(f"[Setup] Created enhanced sink for: {sink['name']}")
 
-    print(f"[Setup] Created {success_count}/{len(VIRTUAL_SINKS)} virtual sinks")
-
-    # Set the first virtual sink as default
-    if first_sink:
-        set_default_sink(first_sink)
-
-    return success_count > 0
+    return configs
 
 
 def remove_virtual_sink(sink_name):
@@ -205,10 +262,24 @@ def remove_virtual_sink(sink_name):
 
 
 def remove_all_virtual_sinks():
-    """Remove all virtual sinks"""
-    print("[Cleanup] Removing virtual sinks...")
-    for key, config in VIRTUAL_SINKS.items():
-        remove_virtual_sink(config["sink_name"])
+    """Remove all NovaSR virtual sinks"""
+    print("[Cleanup] Removing all NovaSR virtual sinks...")
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and NOVASR_PREFIX in parts[1]:
+                remove_virtual_sink(parts[1])
+    except Exception as e:
+        print(f"[Cleanup] Error removing virtual sinks: {e}")
 
 
 class NovaSRProcessor:
@@ -424,25 +495,35 @@ class DeviceProcessor:
         self.sink_name = config["sink_name"]
         self.monitor_source = config["sink_name"] + ".monitor"
         self.physical_sink = config["physical_sink"]
-        # Get the physical sink ID to avoid routing issues
-        self.physical_sink_id = get_sink_id(self.physical_sink)
-        if not self.physical_sink_id:
-            raise ValueError(f"Could not find sink ID for {self.physical_sink}")
         self.description = config["sink_description"]
-
-        self.input_queue = mp.Queue(maxsize=10)
-        self.output_queue = mp.Queue(maxsize=10)
+        # Queues created fresh in start()
+        self.input_queue = None
+        self.output_queue = None
         self.capture_thread = None
         self.playback_thread = None
         self.processor_process = None
         self.active = False
 
+    def get_physical_sink_id(self):
+        """Get the physical sink ID (look up fresh each time)"""
+        return get_sink_id(self.physical_sink)
+
     def start(self):
-        """Start processing for this device"""
+        """Start processing for this device. Returns True on success."""
         if self.active:
-            return
+            return True
+
+        # Get fresh sink ID each time (can change after PipeWire restart)
+        physical_sink_id = self.get_physical_sink_id()
+        if not physical_sink_id:
+            print(f"[{self.description}] Physical sink not found: {self.physical_sink}")
+            return False
 
         print(f"[{self.description}] Starting audio processing...")
+
+        # Create fresh queues
+        self.input_queue = mp.Queue(maxsize=10)
+        self.output_queue = mp.Queue(maxsize=10)
 
         # Start NovaSR processor in separate process
         self.processor_process = mp.Process(
@@ -456,7 +537,7 @@ class DeviceProcessor:
             self.monitor_source, self.input_queue
         )
         self.playback_thread = AudioPlaybackThread(
-            self.physical_sink_id, self.output_queue, self.physical_sink
+            physical_sink_id, self.output_queue, self.physical_sink
         )
 
         self.capture_thread.start()
@@ -464,6 +545,7 @@ class DeviceProcessor:
 
         self.active = True
         print(f"[{self.description}] Processing active")
+        return True
 
     def stop(self):
         """Stop processing for this device"""
@@ -473,14 +555,16 @@ class DeviceProcessor:
         print(f"[{self.description}] Stopping audio processing...")
 
         # Signal shutdown
-        try:
-            self.input_queue.put(None, timeout=1)
-        except:
-            pass
-        try:
-            self.output_queue.put(None, timeout=1)
-        except:
-            pass
+        if self.input_queue:
+            try:
+                self.input_queue.put(None, timeout=1)
+            except:
+                pass
+        if self.output_queue:
+            try:
+                self.output_queue.put(None, timeout=1)
+            except:
+                pass
 
         # Stop threads
         if self.capture_thread:
@@ -501,18 +585,9 @@ class DeviceProcessor:
                 self.processor_process.kill()
             self.processor_process = None
 
-        # Clear queues to prevent old data
-        try:
-            while not self.input_queue.empty():
-                self.input_queue.get_nowait()
-        except:
-            pass
-        try:
-            while not self.output_queue.empty():
-                self.output_queue.get_nowait()
-        except:
-            pass
-
+        # Clear queues
+        self.input_queue = None
+        self.output_queue = None
         self.active = False
         print(f"[{self.description}] Processing stopped")
 
@@ -524,24 +599,17 @@ class DeviceProcessor:
         except Exception as e:
             print(f"[{self.description}] Processor error: {e}")
 
-    def restart(self):
-        """Restart processing with fresh queues"""
-        print(f"[{self.description}] Restarting audio processing...")
-        self.stop()
-        # Create fresh queues
-        self.input_queue = mp.Queue(maxsize=10)
-        self.output_queue = mp.Queue(maxsize=10)
-        time.sleep(0.5)  # Brief pause to ensure cleanup
-        self.start()
-
 
 class NovaSRDaemon:
-    """Main daemon managing all device processors"""
+    """Main daemon managing all device processors with dynamic device detection"""
 
     def __init__(self):
         self.processors = {}
+        self.virtual_configs = {}  # Maps virtual sink name -> config
         self.running = True
         self.check_interval = 2.0  # Check every 2 seconds
+        self.device_scan_interval = 5.0  # Scan for new devices every 5 seconds
+        self.last_device_scan = 0
 
     def get_active_sink(self):
         """Get the currently active/default sink"""
@@ -557,27 +625,136 @@ class NovaSRDaemon:
             print(f"[Daemon] Error getting default sink: {e}")
             return None
 
-    def monitor_and_process(self):
-        """Always keep audio processing running and periodically ensure default sink"""
-        print("[Daemon] Starting monitor loop...")
+    def wait_for_audio_system(self, timeout=30):
+        """Wait for PipeWire/PulseAudio to be ready"""
+        print("[Setup] Waiting for audio system...")
+        start_time = time.time()
 
-        # Start all processors immediately
-        for name, config in VIRTUAL_SINKS.items():
-            if name not in self.processors:
-                self.processors[name] = DeviceProcessor(config)
-                self.processors[name].start()
-                print(f"[Daemon] Started processing for {config['sink_description']}")
+        while time.time() - start_time < timeout:
+            try:
+                result = subprocess.run(
+                    ["pactl", "list", "short", "sinks"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                # Check if we have at least one non-virtual sink
+                sinks = [line for line in result.stdout.strip().split('\n') if line.strip()]
+                real_sinks = [s for s in sinks if NOVASR_PREFIX not in s]
+                if real_sinks:
+                    print(f"[Setup] Audio system ready ({len(real_sinks)} physical sink(s) found)")
+                    return True
+            except:
+                pass
+
+            time.sleep(1)
+
+        print("[Setup] Warning: Audio system not ready after timeout, proceeding anyway")
+        return False
+
+    def scan_and_update_devices(self):
+        """Scan for physical devices and update virtual sinks accordingly"""
+        physical_sinks = get_physical_sinks()
+        current_physical_names = {s["name"] for s in physical_sinks}
+
+        # Get current physical sinks we have configs for
+        known_physical = {c["physical_sink"] for c in self.virtual_configs.values()}
+
+        # Find new devices
+        new_devices = []
+        for sink in physical_sinks:
+            if sink["name"] not in known_physical:
+                new_devices.append(sink)
+
+        # Find removed devices
+        removed_devices = []
+        for physical_name in known_physical:
+            if physical_name not in current_physical_names:
+                removed_devices.append(physical_name)
+
+        # Add new devices
+        for sink in new_devices:
+            config = generate_virtual_sink_config(sink)
+            if create_virtual_sink(config["sink_name"], config["sink_description"]):
+                self.virtual_configs[config["sink_name"]] = config
+                self.processors[config["sink_name"]] = DeviceProcessor(config)
+                print(f"[Daemon] NEW DEVICE: Created enhanced sink for {sink['name']}")
+
+        # Remove disconnected devices
+        for physical_name in removed_devices:
+            # Find the config for this physical device
+            for vname, config in list(self.virtual_configs.items()):
+                if config["physical_sink"] == physical_name:
+                    # Stop processing if active
+                    if vname in self.processors:
+                        if self.processors[vname].active:
+                            self.processors[vname].stop()
+                        del self.processors[vname]
+                    # Remove virtual sink
+                    remove_virtual_sink(vname)
+                    del self.virtual_configs[vname]
+                    print(f"[Daemon] DEVICE REMOVED: {physical_name}")
+                    break
+
+        return len(new_devices) > 0 or len(removed_devices) > 0
+
+    def stop_all_processors(self):
+        """Stop all active processors"""
+        for vname, processor in self.processors.items():
+            if processor.active:
+                processor.stop()
+
+    def monitor_and_process(self):
+        """Monitor sink selection and device changes - only ONE processor active at a time"""
+        print("[Daemon] Starting monitor loop...")
+        print("[Daemon] Select any 'NovaSR_*' device in KDE to enable enhancement")
+        print("[Daemon] Select any other device to disable enhancement")
+        print("[Daemon] Hot-plugging enabled: new devices detected automatically")
+
+        # Do initial device scan
+        self.scan_and_update_devices()
+
+        last_sink = None
+        last_active = None
 
         while self.running:
             try:
-                # Periodically ensure the virtual sink is the default (every 10 seconds)
-                default_sink = self.get_active_sink()
-                for name, config in VIRTUAL_SINKS.items():
-                    virtual_sink = config["sink_name"]
-                    if default_sink != virtual_sink:
-                        print(f"[Daemon] Re-enforcing default sink to {virtual_sink}")
-                        set_default_sink(virtual_sink)
+                current_time = time.time()
+
+                # Periodically scan for new devices
+                if current_time - self.last_device_scan >= self.device_scan_interval:
+                    self.scan_and_update_devices()
+                    self.last_device_scan = current_time
+
+                current_sink = self.get_active_sink()
+
+                # Log sink changes
+                if current_sink != last_sink:
+                    print(f"[Daemon] Default sink: {current_sink}")
+                    last_sink = current_sink
+
+                # Check if current sink is one of our virtual sinks
+                active_virtual = None
+                for vname, config in self.virtual_configs.items():
+                    if config["sink_name"] == current_sink:
+                        active_virtual = vname
                         break
+
+                # Stop previous processor if different (ensures only ONE active)
+                if last_active and last_active != active_virtual:
+                    if last_active in self.processors and self.processors[last_active].active:
+                        print(f"[Daemon] Stopping {last_active}")
+                        self.processors[last_active].stop()
+                    last_active = None
+
+                # Start new processor if needed (with retry if physical sink not ready)
+                if active_virtual and active_virtual != last_active:
+                    if active_virtual in self.processors and not self.processors[active_virtual].active:
+                        print(f"[Daemon] Starting {active_virtual} (selected)")
+                        if self.processors[active_virtual].start():
+                            last_active = active_virtual
+                        else:
+                            print(f"[Daemon] Failed to start {active_virtual}, will retry...")
 
                 time.sleep(self.check_interval)
 
@@ -590,9 +767,7 @@ class NovaSRDaemon:
         print("[Daemon] Shutting down...")
         self.running = False
 
-        for name, processor in self.processors.items():
-            if processor.active:
-                processor.stop()
+        self.stop_all_processors()
 
         # Remove virtual sinks
         remove_all_virtual_sinks()
@@ -602,23 +777,15 @@ class NovaSRDaemon:
     def run(self):
         """Run the daemon"""
         print("=" * 60)
-        print("NovaSR Enhanced Audio Daemon")
+        print("NovaSR Enhanced Audio Daemon (Dynamic Mode)")
         print("=" * 60)
         print(f"Device: {DEVICE}")
         print(f"Processing: {NOVASR_RATE}Hz -> {OUTPUT_RATE}Hz")
-        print()
-        print("Virtual Devices:")
-        for name, config in VIRTUAL_SINKS.items():
-            print(f"  - {config['sink_description']}")
-            print(f"    Virtual: {config['sink_name']}")
-            print(f"    Physical: {config['physical_sink']}")
         print("=" * 60)
         print()
 
-        # Create virtual sinks
-        if not create_all_virtual_sinks():
-            print("[Daemon] Failed to create virtual sinks!")
-            sys.exit(1)
+        # Wait for audio system to be ready
+        self.wait_for_audio_system()
 
         # Handle signals
         def signal_handler(sig, frame):
